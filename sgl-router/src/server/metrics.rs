@@ -323,6 +323,11 @@ pub enum DecodeAffinityOutcome {
 }
 
 impl DecodeAffinityOutcome {
+    #[cfg(test)]
+    pub(crate) fn label(self) -> &'static str {
+        self.as_str()
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             Self::SameHostPicked => "same_host_picked",

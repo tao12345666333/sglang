@@ -34,6 +34,7 @@
 //!    — only the resolver has the cohort context to tell which is which.
 
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
+use crate::server::metrics::DecodeAffinityOutcome;
 use crate::workers::{paired_prefills, Worker, WorkerRegistry};
 use std::sync::Arc;
 
@@ -276,6 +277,20 @@ pub fn select_decode_with_affinity(
     prefill_url: &str,
     candidates: &[Arc<Worker>],
 ) -> Option<Arc<Worker>> {
+    select_decode_with_affinity_outcome(prefill_url, candidates).map(|(worker, _)| worker)
+}
+
+/// Same selection as [`select_decode_with_affinity`], plus the rule that
+/// produced it. Callers that report `sgl_router_decode_affinity_total` need
+/// the rule; the three reasons map onto [`DecodeAffinityOutcome`].
+///
+/// Rule 3 (every breaker open) reports `FallbackBreaker`: the affinity peer,
+/// if any, was rejected by the breaker gate, and the min-load pick is the
+/// fallback for exactly that reason.
+pub fn select_decode_with_affinity_outcome(
+    prefill_url: &str,
+    candidates: &[Arc<Worker>],
+) -> Option<(Arc<Worker>, DecodeAffinityOutcome)> {
     if candidates.is_empty() {
         return None;
     }
@@ -310,13 +325,15 @@ pub fn select_decode_with_affinity(
                 && (load_tolerance == 0 || w.router_inflight_load() <= load_tolerance)
         });
         if let Some(w) = affinity_peer {
-            return Some(Arc::clone(w));
+            return Some((Arc::clone(w), DecodeAffinityOutcome::SameHostPicked));
         }
     }
 
-    // Rule 2: min-load among healthy.
+    // Rule 2: min-load among healthy. Reached either because no candidate
+    // shares the prefill's host, or because the same-host peer was gated out
+    // by the load tolerance — both read as a load-imbalance fallback.
     if let Some(w) = healthy.iter().min_by_key(|w| w.router_inflight_load()) {
-        return Some(Arc::clone(w));
+        return Some((Arc::clone(w), DecodeAffinityOutcome::FallbackLoadImbalance));
     }
 
     // Rule 3: last-resort min-load over all candidates (every
@@ -326,6 +343,7 @@ pub fn select_decode_with_affinity(
         .iter()
         .min_by_key(|w| w.router_inflight_load())
         .cloned()
+        .map(|worker| (worker, DecodeAffinityOutcome::FallbackBreaker))
 }
 
 /// Parse the host portion of a worker URL. Returns `None` when the URL
@@ -627,6 +645,62 @@ mod tests {
             chosen.url, "http://host_a:30001",
             "same-host decode peer must win over remote peer",
         );
+    }
+
+    /// The recorded label matches the rule that fired, for each of the three
+    /// outcomes. `sgl_router_decode_affinity_total` is useless unless the rule
+    /// and the label agree, so pin all three pairings.
+    fn outcome_of(specs: &[WorkerSpec], prefill_url: &str) -> Option<DecodeAffinityOutcome> {
+        let r = registry(specs);
+        let pool: Vec<Arc<Worker>> = r
+            .healthy_workers_for(&ModelId("m".into()))
+            .into_iter()
+            .filter(|w| w.mode() == WorkerMode::Decode)
+            .collect();
+        select_decode_with_affinity_outcome(prefill_url, &pool).map(|(_, outcome)| outcome)
+    }
+
+    #[test]
+    fn affinity_outcome_reports_the_rule_that_fired() {
+        // Rule 1: a same-host peer exists, is healthy, and is within the
+        // load tolerance.
+        let same_host = outcome_of(
+            &[
+                spec_with_url("p1", "http://host_a:30000", WorkerMode::Prefill, "m"),
+                spec_with_url("d1", "http://host_a:30001", WorkerMode::Decode, "m"),
+                spec_with_url("d2", "http://host_b:30001", WorkerMode::Decode, "m"),
+            ],
+            "http://host_a:30000",
+        );
+        assert_eq!(same_host.unwrap().label(), "same_host_picked");
+
+        // Rule 2: no candidate shares the prefill's host.
+        let no_peer = outcome_of(
+            &[
+                spec_with_url("p1", "http://host_a:30000", WorkerMode::Prefill, "m"),
+                spec_with_url("d2", "http://host_b:30001", WorkerMode::Decode, "m"),
+            ],
+            "http://host_a:30000",
+        );
+        assert_eq!(no_peer.unwrap().label(), "fallback_load_imbalance");
+
+        // Rule 3: the only candidate's breaker is open.
+        let r = registry(&[
+            spec_with_url("p1", "http://host_a:30000", WorkerMode::Prefill, "m"),
+            spec_with_url("d1", "http://host_a:30001", WorkerMode::Decode, "m"),
+        ]);
+        let pool: Vec<Arc<Worker>> = r
+            .healthy_workers_for(&ModelId("m".into()))
+            .into_iter()
+            .filter(|w| w.mode() == WorkerMode::Decode)
+            .collect();
+        assert_eq!(pool.len(), 1);
+        for _ in 0..3 {
+            pool[0].breaker.record_failure();
+        }
+        let (_, outcome) =
+            select_decode_with_affinity_outcome("http://host_a:30000", &pool).unwrap();
+        assert_eq!(outcome.label(), "fallback_breaker");
     }
 
     /// Affinity peer's breaker is open → fall back to the remote

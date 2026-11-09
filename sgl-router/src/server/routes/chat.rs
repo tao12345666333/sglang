@@ -608,6 +608,7 @@ fn pick_decode_worker(
         .map_err(|error| pool_error(error, &request.model))?;
     let decode = select_decode_peer(&DecodeSelectionInputs {
         decode_policy_kind: ctx.config.model.decode_policy,
+        metrics: ctx.metrics.as_ref(),
         allow_capacity_fallback,
         bucket_selector: ctx.bucket_selector.as_ref(),
         model_id: &request.model,

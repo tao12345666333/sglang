@@ -20,7 +20,7 @@ pub mod sticky;
 use crate::discovery::ModelId;
 use crate::policies::buckets::{BucketRequest, BucketSelector};
 use crate::policies::scoring::{EligibilityFilter, ScoringPolicy};
-use crate::server::metrics::MetricsRegistry;
+use crate::server::metrics::{DecodeAffinityOutcome, MetricsRegistry};
 use crate::state::kv_events::CacheNamespace;
 pub(crate) use crate::state::kv_events::PrefixLookupResult;
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
@@ -345,6 +345,9 @@ pub struct SelectionProposal {
     pub guard_hints: GuardHints,
     /// Workers available for fallback after eligibility filtering.
     pub eligible_workers: Option<Vec<Arc<Worker>>>,
+    /// Which affinity rule picked `primary`, for policies that consult host
+    /// affinity. `None` for policies with no affinity notion.
+    pub decode_affinity: Option<DecodeAffinityOutcome>,
 }
 
 /// Cache-Aware prefill candidate where `E = L - H`.
@@ -420,6 +423,7 @@ impl SelectionProposal {
             kind: ProposalKind::Generic,
             guard_hints: GuardHints::default(),
             eligible_workers: None,
+            decode_affinity: None,
         }
     }
 
@@ -431,6 +435,7 @@ impl SelectionProposal {
             kind: ProposalKind::PowerOfTwo,
             guard_hints: GuardHints::default(),
             eligible_workers: None,
+            decode_affinity: None,
         }
     }
 
@@ -446,6 +451,13 @@ impl SelectionProposal {
 
     pub fn with_eligible_workers(mut self, workers: Vec<Arc<Worker>>) -> Self {
         self.eligible_workers = Some(workers);
+        self
+    }
+
+    /// Records which affinity rule produced the proposal, so the caller that
+    /// commits the selection can report it.
+    pub fn with_decode_affinity(mut self, outcome: DecodeAffinityOutcome) -> Self {
+        self.decode_affinity = Some(outcome);
         self
     }
 }

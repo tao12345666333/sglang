@@ -743,6 +743,8 @@ fn prefill_policy_reason(
 /// per-request facts.
 pub(crate) struct DecodeSelectionInputs<'a> {
     pub decode_policy_kind: DecodePolicyKind,
+    /// Receives `sgl_router_decode_affinity_total` for the committed pick.
+    pub metrics: &'a MetricsRegistry,
     /// Disable for version-group probes so full groups do not count as admissible.
     pub allow_capacity_fallback: bool,
     pub bucket_selector: &'a BucketSelector,
@@ -820,6 +822,11 @@ pub(crate) fn select_decode_peer(inputs: &DecodeSelectionInputs<'_>) -> Option<A
             load_snapshot_version = decode_decision.load_snapshot_version,
             "decode policy decision",
         );
+        // Report only the committed pick: rungs that yielded nothing, and
+        // proposals admission replaced, would otherwise inflate the counter.
+        if let Some(outcome) = decode_proposal.decode_affinity {
+            inputs.metrics.record_decode_affinity(outcome);
+        }
         Some(decode_decision.selected)
     };
     decode_domains
@@ -864,7 +871,19 @@ mod tests {
     };
     use crate::workers::Worker;
     use std::sync::Arc;
+    use std::sync::LazyLock;
     use std::time::Instant;
+
+    /// A worker at an explicit URL, so host affinity has something to match on.
+    fn worker_at(id: &str, url: &str) -> Arc<Worker> {
+        Arc::new(Worker::new(WorkerSpec {
+            id: WorkerId(id.into()),
+            url: url.into(),
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId("model".into())],
+            ..Default::default()
+        }))
+    }
 
     fn worker(id: &str) -> Arc<Worker> {
         Arc::new(Worker::new(WorkerSpec {
@@ -999,6 +1018,10 @@ mod tests {
         }
     }
 
+    /// Affinity recording is exercised by its own tests; decode-selection
+    /// tests only need a registry that accepts the counter.
+    static TEST_METRICS: LazyLock<MetricsRegistry> = LazyLock::new(MetricsRegistry::default);
+
     fn decode_inputs<'a>(
         bucket_selector: &'a BucketSelector,
         model_id: &'a ModelId,
@@ -1008,6 +1031,7 @@ mod tests {
     ) -> DecodeSelectionInputs<'a> {
         DecodeSelectionInputs {
             decode_policy_kind: DecodePolicyKind::PowerOfTwo,
+            metrics: &TEST_METRICS,
             allow_capacity_fallback: true,
             bucket_selector,
             model_id,
@@ -1258,6 +1282,35 @@ mod tests {
             .expect("one worker has room");
             assert_eq!(selected.id, roomy.id);
         }
+    }
+
+    /// `sgl_router_decode_affinity_total` was documented but never recorded
+    /// (sgl-project/sglang#32752): the counter's only callers were its own
+    /// unit tests. Pin that a committed legacy-host-affinity pick now lands in
+    /// the registry.
+    #[test]
+    fn a_committed_affinity_pick_lands_in_the_metric() {
+        // Two decode peers, one on the prefill's host: rule 1 fires.
+        let decode_a = worker_at("decode-a", "http://host_a:30001");
+        let decode_b = worker_at("decode-b", "http://host_b:30001");
+        let workers = vec![Arc::clone(&decode_a), Arc::clone(&decode_b)];
+        let loads = snapshot(&[(&decode_a, 0, 100_000), (&decode_b, 0, 100_000)]);
+        let buckets = BucketSelector::new(None);
+        let model = ModelId("model".into());
+        let metrics = MetricsRegistry::default();
+
+        let mut inputs = decode_inputs(&buckets, &model, &workers, Some(&loads), 64);
+        inputs.decode_policy_kind = DecodePolicyKind::LegacyHostAffinity;
+        inputs.prefill_url = "http://host_a:30000";
+        inputs.metrics = &metrics;
+        let selected = select_decode_peer(&inputs).expect("rule 1 places the request");
+        assert_eq!(selected.url, "http://host_a:30001", "same-host peer wins");
+
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains(r#"sgl_router_decode_affinity_total{outcome="same_host_picked"} 1"#),
+            "committed pick must be counted; got:\n{rendered}",
+        );
     }
 
     #[test]

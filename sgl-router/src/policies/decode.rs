@@ -8,7 +8,7 @@ use crate::policies::admission::{
     compare_decode_engines, resolve_decode, CandidateDomain, DecisionReason, FinalDecision,
     RoutingStage,
 };
-use crate::policies::registry::select_decode_with_affinity;
+use crate::policies::registry::select_decode_with_affinity_outcome;
 use crate::policies::{ProposalKind, SelectionProposal};
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use rand::Rng;
@@ -151,7 +151,8 @@ impl DecodePolicy for LegacyHostAffinityDecodePolicy {
         ctx: &DecodeSelectionContext<'_>,
     ) -> Option<SelectionProposal> {
         let prefill_url = ctx.prefill_url()?;
-        select_decode_with_affinity(prefill_url, &domain.workers).map(SelectionProposal::primary)
+        let (worker, outcome) = select_decode_with_affinity_outcome(prefill_url, &domain.workers)?;
+        Some(SelectionProposal::primary(worker).with_decode_affinity(outcome))
     }
 }
 
